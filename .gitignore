@@ -1,0 +1,6 @@
+.venv/
+vec_add
+vec_add_dbg
+gemm
+gemm_dbg
+*.ncu-rep

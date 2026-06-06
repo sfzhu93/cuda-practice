@@ -1,0 +1,15 @@
+CompileFlags:
+  Add:
+    - --cuda-path=/home/jdoe/cuda_practice/.venv/lib/python3.13/site-packages/nvidia/cu13
+    - --cuda-gpu-arch=sm_120
+    - -x
+    - cuda
+
+---
+
+If:
+  PathMatch: ".*\\.cu"
+CompileFlags:
+  Add:
+    - --cuda-path=/home/jdoe/cuda_practice/.venv/lib/python3.13/site-packages/nvidia/cu13
+    - --cuda-gpu-arch=sm_120
