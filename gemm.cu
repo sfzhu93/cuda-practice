@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
 
 using namespace nvcuda;
 
@@ -199,6 +200,75 @@ __global__ void gemm_wmma_async(const half* A, const half* B, float* C,
         wmma::store_matrix_sync(C + out_row * N + out_col, c_frag, N, wmma::mem_row_major);
 }
 
+// WMMA + register tiling: each warp computes 2x2 grid of 16x16 tiles
+// 64x64 block = 2x2 warps, each warp covers 32x32 output
+#define RT_BLOCK 64
+#define RT_WARP_M 2
+#define RT_WARP_N 2
+
+__global__ void gemm_wmma_regtile(const half* A, const half* B, float* C,
+                                    int M, int N, int K) {
+    constexpr int WM = 16;
+    constexpr int WARPS_M = RT_BLOCK / (RT_WARP_M * WM);
+    constexpr int WARPS_N = RT_BLOCK / (RT_WARP_N * WM);
+
+    __shared__ half As[RT_BLOCK * WM];
+    __shared__ half Bs[WM * RT_BLOCK];
+
+    int warpId = threadIdx.x / 32;
+    int warpRow = warpId / WARPS_N;
+    int warpCol = warpId % WARPS_N;
+    int block_row = blockIdx.y * RT_BLOCK;
+    int block_col = blockIdx.x * RT_BLOCK;
+
+    wmma::fragment<wmma::accumulator, WM, WM, WM, float> c_frag[RT_WARP_M][RT_WARP_N];
+    for (int i = 0; i < RT_WARP_M; i++)
+        for (int j = 0; j < RT_WARP_N; j++)
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+
+    for (int t = 0; t < K; t += WM) {
+        for (int idx = threadIdx.x; idx < RT_BLOCK * WM; idx += blockDim.x) {
+            int r = idx / WM, c = idx % WM;
+            int gr = block_row + r, gc = t + c;
+            As[idx] = (gr < M && gc < K) ? A[gr * K + gc] : __float2half(0.0f);
+        }
+        for (int idx = threadIdx.x; idx < WM * RT_BLOCK; idx += blockDim.x) {
+            int r = idx / RT_BLOCK, c = idx % RT_BLOCK;
+            int gr = t + r, gc = block_col + c;
+            Bs[idx] = (gr < K && gc < N) ? B[gr * N + gc] : __float2half(0.0f);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, WM, WM, WM, half, wmma::row_major> a_frag[RT_WARP_M];
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, half, wmma::row_major> b_frag[RT_WARP_N];
+
+        for (int i = 0; i < RT_WARP_M; i++) {
+            int a_row = (warpRow * RT_WARP_M + i) * WM;
+            wmma::load_matrix_sync(a_frag[i], &As[a_row * WM], WM);
+        }
+        for (int j = 0; j < RT_WARP_N; j++) {
+            int b_col = (warpCol * RT_WARP_N + j) * WM;
+            wmma::load_matrix_sync(b_frag[j], &Bs[b_col], RT_BLOCK);
+        }
+
+        for (int i = 0; i < RT_WARP_M; i++)
+            for (int j = 0; j < RT_WARP_N; j++)
+                wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+
+        __syncthreads();
+    }
+
+    for (int i = 0; i < RT_WARP_M; i++) {
+        for (int j = 0; j < RT_WARP_N; j++) {
+            int out_row = block_row + (warpRow * RT_WARP_M + i) * WM;
+            int out_col = block_col + (warpCol * RT_WARP_N + j) * WM;
+            if (out_row < M && out_col < N)
+                wmma::store_matrix_sync(C + out_row * N + out_col, c_frag[i][j], N,
+                                        wmma::mem_row_major);
+        }
+    }
+}
+
 // CPU reference
 void gemm_cpu(const float* A, const float* B, float* C, int M, int N, int K) {
     for (int i = 0; i < M; i++)
@@ -229,7 +299,13 @@ int main() {
     for (int i = 0; i < M * K; i++) h_A[i] = (float)rand() / RAND_MAX;
     for (int i = 0; i < K * N; i++) h_B[i] = (float)rand() / RAND_MAX;
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     gemm_cpu(h_A, h_B, h_ref, M, N, K);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double cpu_s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double cpu_tflops = 2.0 * M * N * K / cpu_s / 1e12;
+    printf("gemm_cpu:        M=%d N=%d K=%d, %.3f s, %.4f TFLOPS\n", M, N, K, cpu_s, cpu_tflops);
 
     float *d_A, *d_B, *d_C;
     CHECK_CUDA(cudaMalloc(&d_A, M * K * sizeof(float)));
@@ -297,6 +373,19 @@ int main() {
     printf("gemm_wmma_async: M=%d N=%d K=%d, max_err=%.6f — %s\n",
            M, N, K, async_err,
            async_err < 5e-1f ? "PASS" : "FAIL");
+
+    // --- wmma + register tiling ---
+    CHECK_CUDA(cudaMemset(d_C, 0, M * N * sizeof(float)));
+    dim3 rt_block(128);
+    dim3 rt_grid((N + RT_BLOCK - 1) / RT_BLOCK, (M + RT_BLOCK - 1) / RT_BLOCK);
+    gemm_wmma_regtile<<<rt_grid, rt_block>>>(d_A_half, d_B_half, d_C, M, N, K);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    float rt_err = max_diff(h_ref, h_C, M * N);
+    printf("gemm_regtile:    M=%d N=%d K=%d, max_err=%.6f — %s\n",
+           M, N, K, rt_err,
+           rt_err < 5e-1f ? "PASS" : "FAIL");
 
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     cudaFree(d_A_half); cudaFree(d_B_half);
