@@ -1,6 +1,10 @@
 .venv/
 vec_add
-vec_add_dbg
 gemm
-gemm_dbg
+bench_gemm
+*_dbg
+*_tmp
 *.ncu-rep
+*.ptx
+*.sass
+*.cubin

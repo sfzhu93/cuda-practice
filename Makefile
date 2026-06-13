@@ -7,7 +7,7 @@ GPU_ARCH := sm_120
 NVCCFLAGS := -arch=$(GPU_ARCH) -O2 -Xcompiler -Wall
 NVCCFLAGS_DBG := -arch=$(GPU_ARCH) -O2 -g -lineinfo -Xcompiler -Wall
 
-TARGETS := vec_add gemm
+TARGETS := vec_add gemm bench_gemm
 
 NCU      := $(HOME)/tools/ncu-bin/ncu
 PROFILE  ?= gemm

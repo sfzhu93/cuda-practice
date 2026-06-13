@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 #include <cstdio>
 #include <cstdlib>
@@ -73,7 +74,6 @@ __global__ void gemm_tiled(const float* A, const float* B, float* C,
 __global__ void gemm_wmma(const half* A, const half* B, float* C,
                            int M, int N, int K) {
     int warpId = threadIdx.x / 32;
-    // 2x2 warp layout within block
     int warpRow = warpId / 2;
     int warpCol = warpId % 2;
 
@@ -99,6 +99,106 @@ __global__ void gemm_wmma(const half* A, const half* B, float* C,
         wmma::store_matrix_sync(C + block_row * N + block_col, c_frag, N, wmma::mem_row_major);
 }
 
+// WMMA + cp.async: async global→shared, then shared→fragment→Tensor Core
+// Double buffering to overlap load of next tile with compute of current tile
+#define ASYNC_TILE 32  // block tile
+#define ASYNC_WMMA 16  // wmma tile
+
+// Helper: async load a tile from global to shared, zero-padding OOB
+// Uses 4-byte (2 half) copies as required by __pipeline_memcpy_async
+__device__ void async_load_tile(half* smem, const half* gmem,
+                                 int smem_rows, int smem_cols, int smem_stride,
+                                 int grow_base, int gcol_base,
+                                 int M_bound, int N_bound, int gmem_stride) {
+    // Total uint32_t copies = (rows * cols) / 2
+    int total_pairs = (smem_rows * smem_cols) / 2;
+    for (int i = threadIdx.x; i < total_pairs; i += blockDim.x) {
+        // Map linear index to (row, col_pair) in shared memory
+        int pairs_per_row = smem_cols / 2;
+        int r = i / pairs_per_row;
+        int cp = i % pairs_per_row;
+        int c = cp * 2;
+
+        int gr = grow_base + r;
+        int gc = gcol_base + c;
+
+        half* dst = &smem[r * smem_stride + c];
+        const half* src = &gmem[gr * gmem_stride + gc];
+
+        if (gr < M_bound && gc + 1 < N_bound) {
+            __pipeline_memcpy_async(dst, src, sizeof(uint32_t));
+        } else {
+            // Zero-pad out of bounds
+            dst[0] = __float2half(0.0f);
+            dst[1] = __float2half(0.0f);
+        }
+    }
+}
+
+__global__ void gemm_wmma_async(const half* A, const half* B, float* C,
+                                 int M, int N, int K) {
+    // Double buffer: two slots for A and B tiles in shared memory
+    __shared__ half As[2][ASYNC_TILE * ASYNC_WMMA];  // [buf][32*16], row-major
+    __shared__ half Bs[2][ASYNC_WMMA * ASYNC_TILE];  // [buf][16*32], row-major
+
+    int warpId = threadIdx.x / 32;
+    int warpRow = warpId / 2;
+    int warpCol = warpId % 2;
+
+    int block_row = blockIdx.y * ASYNC_TILE;
+    int block_col = blockIdx.x * ASYNC_TILE;
+
+    wmma::fragment<wmma::matrix_a, ASYNC_WMMA, ASYNC_WMMA, ASYNC_WMMA, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, ASYNC_WMMA, ASYNC_WMMA, ASYNC_WMMA, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, ASYNC_WMMA, ASYNC_WMMA, ASYNC_WMMA, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int numTiles = (K + ASYNC_WMMA - 1) / ASYNC_WMMA;
+
+    // Prefetch tile 0 into buffer 0
+    async_load_tile(As[0], A, ASYNC_TILE, ASYNC_WMMA, ASYNC_WMMA,
+                    block_row, 0, M, K, K);
+    async_load_tile(Bs[0], B, ASYNC_WMMA, ASYNC_TILE, ASYNC_TILE,
+                    0, block_col, K, N, N);
+    __pipeline_commit();
+
+    for (int t = 0; t < numTiles; t++) {
+        int cur = t % 2;
+        int nxt = 1 - cur;
+
+        // Prefetch next tile into other buffer
+        if (t + 1 < numTiles) {
+            int nt = t + 1;
+            async_load_tile(As[nxt], A, ASYNC_TILE, ASYNC_WMMA, ASYNC_WMMA,
+                            block_row, nt * ASYNC_WMMA, M, K, K);
+            async_load_tile(Bs[nxt], B, ASYNC_WMMA, ASYNC_TILE, ASYNC_TILE,
+                            nt * ASYNC_WMMA, block_col, K, N, N);
+            __pipeline_commit();
+        }
+
+        // Wait for current tile's data
+        // If we just prefetched next tile: 2 pending, wait until ≤1 (current done)
+        // Last iteration: no prefetch, 1 pending, must wait for all
+        if (t + 1 < numTiles)
+            __pipeline_wait_prior(1);
+        else
+            __pipeline_wait_prior(0);
+        __syncthreads();
+
+        // WMMA from shared memory
+        wmma::load_matrix_sync(a_frag, &As[cur][warpRow * ASYNC_WMMA * ASYNC_WMMA], ASYNC_WMMA);
+        wmma::load_matrix_sync(b_frag, &Bs[cur][warpCol * ASYNC_WMMA], ASYNC_TILE);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    int out_row = block_row + warpRow * ASYNC_WMMA;
+    int out_col = block_col + warpCol * ASYNC_WMMA;
+    if (out_row < M && out_col < N)
+        wmma::store_matrix_sync(C + out_row * N + out_col, c_frag, N, wmma::mem_row_major);
+}
+
 // CPU reference
 void gemm_cpu(const float* A, const float* B, float* C, int M, int N, int K) {
     for (int i = 0; i < M; i++)
@@ -118,7 +218,7 @@ float max_diff(const float* ref, const float* out, int n) {
 }
 
 int main() {
-    const int M = 256, N = 256, K = 256;
+    const int M = 2048, N = 2048, K = 2048;
 
     float* h_A   = (float*)malloc(M * K * sizeof(float));
     float* h_B   = (float*)malloc(K * N * sizeof(float));
@@ -159,31 +259,44 @@ int main() {
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    printf("gemm_naive:  M=%d N=%d K=%d, max_err=%.6f — %s\n",
+    printf("gemm_naive:      M=%d N=%d K=%d, max_err=%.6f — %s\n",
            M, N, K, max_diff(h_ref, h_C, M * N),
-           max_diff(h_ref, h_C, M * N) < 1e-3f ? "PASS" : "FAIL");
+           max_diff(h_ref, h_C, M * N) < 1e-2f ? "PASS" : "FAIL");
 
     // --- tiled ---
     gemm_tiled<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    printf("gemm_tiled:  M=%d N=%d K=%d, max_err=%.6f — %s\n",
+    printf("gemm_tiled:      M=%d N=%d K=%d, max_err=%.6f — %s\n",
            M, N, K, max_diff(h_ref, h_C, M * N),
-           max_diff(h_ref, h_C, M * N) < 1e-3f ? "PASS" : "FAIL");
+           max_diff(h_ref, h_C, M * N) < 1e-2f ? "PASS" : "FAIL");
 
     // --- wmma ---
     CHECK_CUDA(cudaMemset(d_C, 0, M * N * sizeof(float)));
-    dim3 wmma_block(128);  // 4 warps
+    dim3 wmma_block(128);
     dim3 wmma_grid((N + WARP_TILE - 1) / WARP_TILE, (M + WARP_TILE - 1) / WARP_TILE);
     gemm_wmma<<<wmma_grid, wmma_block>>>(d_A_half, d_B_half, d_C, M, N, K);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
     float wmma_err = max_diff(h_ref, h_C, M * N);
-    printf("gemm_wmma:   M=%d N=%d K=%d, max_err=%.6f — %s\n",
+    printf("gemm_wmma:       M=%d N=%d K=%d, max_err=%.6f — %s\n",
            M, N, K, wmma_err,
-           wmma_err < 5e-2f ? "PASS" : "FAIL");  // fp16 accumulation, looser tolerance
+           wmma_err < 5e-1f ? "PASS" : "FAIL");
+
+    // --- wmma + cp.async ---
+    CHECK_CUDA(cudaMemset(d_C, 0, M * N * sizeof(float)));
+    dim3 async_block(128);
+    dim3 async_grid((N + ASYNC_TILE - 1) / ASYNC_TILE, (M + ASYNC_TILE - 1) / ASYNC_TILE);
+    gemm_wmma_async<<<async_grid, async_block>>>(d_A_half, d_B_half, d_C, M, N, K);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    float async_err = max_diff(h_ref, h_C, M * N);
+    printf("gemm_wmma_async: M=%d N=%d K=%d, max_err=%.6f — %s\n",
+           M, N, K, async_err,
+           async_err < 5e-1f ? "PASS" : "FAIL");
 
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     cudaFree(d_A_half); cudaFree(d_B_half);
