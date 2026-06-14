@@ -9,6 +9,8 @@ NVCCFLAGS_DBG := -arch=$(GPU_ARCH) -O2 -g -lineinfo -Xcompiler -Wall
 
 TARGETS := vec_add gemm bench_gemm
 
+gemm bench_gemm: kernels.cuh
+
 NCU      := $(HOME)/tools/ncu-bin/ncu
 PROFILE  ?= gemm
 
